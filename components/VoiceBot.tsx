@@ -11,6 +11,14 @@ const MAX_INPUT_CHARS = 500;
 const HISTORY_LIMIT = 6;
 const MIME_CANDIDATES = ["audio/webm;codecs=opus", "audio/webm", "audio/mp4", "audio/ogg;codecs=opus", "audio/ogg"];
 
+// Voice activity detection (hands-free mode)
+const VAD_INTERVAL_MS = 50;
+const CALIBRATE_MS = 300; // measure background noise first
+const MIN_SPEECH_MS = 250; // this much voice before we count it as speech
+const END_SILENCE_MS = 1300; // pause length that ends a turn
+const NO_SPEECH_MS = 8000; // nobody spoke: pause the conversation
+const RELISTEN_DELAY_MS = 350;
+
 const SAMPLES = [
   "Tell me about your life story.",
   "What's your number one superpower?",
@@ -18,13 +26,6 @@ const SAMPLES = [
   "What misconception do your coworkers have about you?",
   "How do you push your boundaries and limits?",
 ];
-
-const STATUS_LABEL: Record<Status, string> = {
-  idle: "Tap the mic and ask me anything",
-  listening: "Listening... tap again when you're done",
-  thinking: "Thinking...",
-  speaking: "Speaking...",
-};
 
 function pickMimeType(): string | null {
   if (typeof MediaRecorder === "undefined") return null;
@@ -67,16 +68,30 @@ export default function VoiceBot() {
   const [notice, setNotice] = useState<string | null>(null);
   const [seconds, setSeconds] = useState(0);
   const [ttsAvailable, setTtsAvailable] = useState(true);
+  const [handsFree, setHandsFree] = useState(true);
+  const [inConversation, setInConversation] = useState(false);
+  const [level, setLevel] = useState(0);
+  const [hearing, setHearing] = useState(false);
 
   const recorderRef = useRef<MediaRecorder | null>(null);
   const streamRef = useRef<MediaStream | null>(null);
   const chunksRef = useRef<Blob[]>([]);
-  const timersRef = useRef<{ stop?: number; tick?: number }>({});
+  const timersRef = useRef<{ stop?: number; tick?: number; vad?: number; speak?: number; relisten?: number }>({});
   const abortRef = useRef<AbortController | null>(null);
   const voicesRef = useRef<SpeechSynthesisVoice[]>([]);
   const cancelledRef = useRef(false);
   const messagesRef = useRef<Msg[]>([]);
   const logRef = useRef<HTMLDivElement | null>(null);
+  const audioCtxRef = useRef<AudioContext | null>(null);
+  const sourceRef = useRef<MediaStreamAudioSourceNode | null>(null);
+  const handsFreeRef = useRef(true);
+  const conversationRef = useRef(false); // hands-free loop is running
+  const emptyTurnsRef = useRef(0);
+  const startRecordingRef = useRef<() => void>(() => {});
+
+  useEffect(() => {
+    handsFreeRef.current = handsFree;
+  }, [handsFree]);
 
   useEffect(() => {
     messagesRef.current = messages;
@@ -97,26 +112,69 @@ export default function VoiceBot() {
     return () => window.speechSynthesis.removeEventListener("voiceschanged", load);
   }, []);
 
-  const clearTimers = () => {
-    window.clearTimeout(timersRef.current.stop);
-    window.clearInterval(timersRef.current.tick);
-    timersRef.current = {};
+  const setConversation = (on: boolean) => {
+    conversationRef.current = on;
+    setInConversation(on);
+    if (!on) emptyTurnsRef.current = 0;
+  };
+
+  const clearRecordTimers = () => {
+    const t = timersRef.current;
+    window.clearTimeout(t.stop);
+    window.clearInterval(t.tick);
+    window.clearInterval(t.vad);
+    t.stop = t.tick = t.vad = undefined;
+  };
+
+  const clearSpeakTimers = () => {
+    const t = timersRef.current;
+    window.clearInterval(t.speak);
+    window.clearTimeout(t.relisten);
+    t.speak = t.relisten = undefined;
   };
 
   const releaseMic = () => {
+    try {
+      sourceRef.current?.disconnect();
+    } catch {
+      /* ignore */
+    }
+    sourceRef.current = null;
     streamRef.current?.getTracks().forEach((t) => t.stop());
     streamRef.current = null;
+    setLevel(0);
+    setHearing(false);
   };
 
   useEffect(
     () => () => {
-      clearTimers();
+      conversationRef.current = false;
+      clearRecordTimers();
+      clearSpeakTimers();
       releaseMic();
       abortRef.current?.abort();
       if ("speechSynthesis" in window) window.speechSynthesis.cancel();
+      void audioCtxRef.current?.close().catch(() => {});
     },
     [],
   );
+
+  /** Pause the hands-free loop with a message; the user taps the mic to resume. */
+  const pauseConversation = (message: string | null) => {
+    setConversation(false);
+    if (message) setNotice(message);
+  };
+
+  /** Called when the bot has finished speaking (or nothing was spoken). Re-opens the mic in hands-free mode. */
+  const afterReply = useCallback(() => {
+    clearSpeakTimers();
+    setStatus("idle");
+    if (conversationRef.current) {
+      timersRef.current.relisten = window.setTimeout(() => {
+        if (conversationRef.current) startRecordingRef.current();
+      }, RELISTEN_DELAY_MS);
+    }
+  }, []);
 
   const pickVoice = (text: string): SpeechSynthesisVoice | undefined => {
     const voices = voicesRef.current;
@@ -130,41 +188,52 @@ export default function VoiceBot() {
     return voices[0];
   };
 
-  const speak = useCallback((text: string) => {
-    if (!("speechSynthesis" in window)) {
-      setTtsAvailable(false);
-      setStatus("idle");
-      return;
-    }
-    const synth = window.speechSynthesis;
-    synth.cancel();
-    const chunks = splitSentences(text);
-    if (!voicesRef.current.length) voicesRef.current = synth.getVoices();
-    const voice = pickVoice(text);
-    if (!voice && !voicesRef.current.length) {
-      setNotice("No speech voices are available in this browser, so replies are shown as text.");
-    }
-    setStatus("speaking");
-    chunks.forEach((chunk, i) => {
-      const u = new SpeechSynthesisUtterance(chunk);
-      if (voice) {
-        u.voice = voice;
-        u.lang = voice.lang;
+  const speak = useCallback(
+    (text: string) => {
+      if (!("speechSynthesis" in window)) {
+        setTtsAvailable(false);
+        afterReply();
+        return;
       }
-      u.rate = 1.02;
-      if (i === chunks.length - 1) {
-        u.onend = () => setStatus((s) => (s === "speaking" ? "idle" : s));
-        u.onerror = () => setStatus((s) => (s === "speaking" ? "idle" : s));
+      const synth = window.speechSynthesis;
+      synth.cancel();
+      clearSpeakTimers();
+      if (!voicesRef.current.length) voicesRef.current = synth.getVoices();
+      const voice = pickVoice(text);
+      if (!voice && !voicesRef.current.length) {
+        setNotice("No speech voices are available in this browser, so replies are shown as text.");
       }
-      synth.speak(u);
-    });
-  }, []);
+      setStatus("speaking");
+      for (const chunk of splitSentences(text)) {
+        const u = new SpeechSynthesisUtterance(chunk);
+        if (voice) {
+          u.voice = voice;
+          u.lang = voice.lang;
+        }
+        u.rate = 1.02;
+        synth.speak(u);
+      }
+      // Poll instead of relying on onend, which some browsers fail to fire.
+      const startedAt = Date.now();
+      let seen = false;
+      timersRef.current.speak = window.setInterval(() => {
+        if (synth.speaking || synth.pending) {
+          seen = true;
+          return;
+        }
+        if (!seen && Date.now() - startedAt < 1500) return; // not started yet
+        afterReply();
+      }, 250);
+    },
+    [afterReply],
+  );
 
   const ask = useCallback(
     async (question: string) => {
       const text = question.trim().slice(0, MAX_INPUT_CHARS);
       if (!text) return;
       setNotice(null);
+      clearSpeakTimers();
       if ("speechSynthesis" in window) window.speechSynthesis.cancel();
 
       const history = [...messagesRef.current, { role: "user" as const, content: text }];
@@ -186,14 +255,14 @@ export default function VoiceBot() {
         });
         const data = (await res.json().catch(() => ({}))) as { reply?: string; error?: string };
         if (!res.ok || typeof data.reply !== "string") {
-          setNotice(data.error ?? "Something went wrong. Please try again.");
+          pauseConversation(data.error ?? "Something went wrong. Please try again.");
           setStatus("idle");
           return;
         }
         setMessages((m) => [...m, { role: "assistant", content: data.reply! }]);
         speak(data.reply);
       } catch (err) {
-        if ((err as Error).name !== "AbortError") setNotice("Network problem. Please check your connection and try again.");
+        if ((err as Error).name !== "AbortError") pauseConversation("Network problem. Please check your connection and try again.");
         setStatus("idle");
       } finally {
         if (abortRef.current === ctrl) abortRef.current = null;
@@ -202,15 +271,29 @@ export default function VoiceBot() {
     [speak],
   );
 
+  /** In hands-free mode an unclear turn just re-opens the mic, up to twice in a row. */
+  const unclearTurn = useCallback(
+    (message: string) => {
+      if (conversationRef.current && emptyTurnsRef.current < 2) {
+        emptyTurnsRef.current += 1;
+        setNotice(message);
+        afterReply();
+        return;
+      }
+      pauseConversation(message);
+      setStatus("idle");
+    },
+    [afterReply],
+  );
+
   const sendAudio = useCallback(
     async (blob: Blob, mime: string) => {
       if (blob.size < 1200) {
-        setNotice("I didn't catch that. Please hold the mic a little longer and try again.");
-        setStatus("idle");
+        unclearTurn("I didn't catch that. Please try again.");
         return;
       }
       if (blob.size > MAX_AUDIO_BYTES) {
-        setNotice("That recording was too long. Please keep questions under 30 seconds.");
+        pauseConversation("That recording was too long. Please keep questions under 30 seconds.");
         setStatus("idle");
         return;
       }
@@ -223,58 +306,141 @@ export default function VoiceBot() {
         const res = await fetch("/api/transcribe", { method: "POST", body: form, signal: ctrl.signal });
         const data = (await res.json().catch(() => ({}))) as { text?: string; error?: string };
         if (!res.ok) {
-          setNotice(data.error ?? "Transcription failed. Please try again.");
+          pauseConversation(data.error ?? "Transcription failed. Please try again.");
           setStatus("idle");
           return;
         }
         if (!data.text) {
-          setNotice("I didn't catch that. Could you repeat the question?");
-          setStatus("idle");
+          unclearTurn("I didn't catch that. Could you repeat the question?");
           return;
         }
+        emptyTurnsRef.current = 0;
         if (abortRef.current === ctrl) abortRef.current = null;
         await ask(data.text);
       } catch (err) {
-        if ((err as Error).name !== "AbortError") setNotice("Network problem. Please check your connection and try again.");
+        if ((err as Error).name !== "AbortError") pauseConversation("Network problem. Please check your connection and try again.");
         setStatus("idle");
       } finally {
         if (abortRef.current === ctrl) abortRef.current = null;
       }
     },
-    [ask],
+    [ask, unclearTurn],
   );
 
   const stopRecording = useCallback(() => {
-    clearTimers();
+    clearRecordTimers();
     const rec = recorderRef.current;
     if (rec && rec.state !== "inactive") rec.stop();
   }, []);
 
+  /** Shared AudioContext, created on a user tap so iOS lets it run during later automatic turns. */
+  const ensureAudioContext = () => {
+    if (audioCtxRef.current) {
+      void audioCtxRef.current.resume().catch(() => {});
+      return audioCtxRef.current;
+    }
+    const AC = window.AudioContext ?? (window as unknown as { webkitAudioContext?: typeof AudioContext }).webkitAudioContext;
+    if (!AC) return null;
+    try {
+      audioCtxRef.current = new AC();
+      void audioCtxRef.current.resume().catch(() => {});
+    } catch {
+      audioCtxRef.current = null;
+    }
+    return audioCtxRef.current;
+  };
+
+  /** Watches mic volume: ends the turn after a pause, or pauses the conversation if nobody speaks. */
+  const startVad = (stream: MediaStream) => {
+    const ctx = audioCtxRef.current;
+    if (!ctx) return;
+    let analyser: AnalyserNode;
+    try {
+      const source = ctx.createMediaStreamSource(stream);
+      analyser = ctx.createAnalyser();
+      analyser.fftSize = 1024;
+      source.connect(analyser);
+      sourceRef.current = source;
+    } catch {
+      return; // no VAD: the user can still tap to stop, and the 30 s cap applies
+    }
+    const buf = new Float32Array(analyser.fftSize);
+    const t0 = performance.now();
+    let last = t0;
+    let floorSum = 0;
+    let floorN = 0;
+    let voiceMs = 0;
+    let lastVoiceAt = 0;
+    let started = false;
+
+    timersRef.current.vad = window.setInterval(() => {
+      analyser.getFloatTimeDomainData(buf);
+      let sum = 0;
+      for (let i = 0; i < buf.length; i++) sum += buf[i] * buf[i];
+      const rms = Math.sqrt(sum / buf.length);
+      const now = performance.now();
+      const dt = now - last;
+      last = now;
+      setLevel(Math.min(1, rms * 12));
+
+      if (now - t0 < CALIBRATE_MS) {
+        floorSum += rms;
+        floorN += 1;
+        return;
+      }
+      const floor = Math.min(floorN ? floorSum / floorN : 0.005, 0.02);
+      const threshold = Math.max(0.012, floor * 3);
+
+      if (rms > threshold) {
+        voiceMs += dt;
+        lastVoiceAt = now;
+        if (voiceMs >= MIN_SPEECH_MS && !started) {
+          started = true;
+          setHearing(true);
+        }
+      } else if (!started) {
+        voiceMs = Math.max(0, voiceMs - dt / 2);
+      }
+
+      if (!handsFreeRef.current) return; // tap-to-talk: meter only
+      if (started && now - lastVoiceAt > END_SILENCE_MS) {
+        stopRecording();
+      } else if (!started && now - t0 > NO_SPEECH_MS) {
+        cancelledRef.current = true;
+        stopRecording();
+        pauseConversation("Conversation paused. Tap the mic whenever you want to keep talking.");
+      }
+    }, VAD_INTERVAL_MS);
+  };
+
   const startRecording = useCallback(async () => {
-    setNotice(null);
+    clearSpeakTimers();
     if (!window.isSecureContext || !navigator.mediaDevices?.getUserMedia) {
-      setNotice("Voice input needs a secure (https) page and a modern browser. You can type your question below.");
+      pauseConversation("Voice input needs a secure (https) page and a modern browser. You can type your question below.");
       return;
     }
     const mime = pickMimeType();
     if (mime === null) {
-      setNotice("This browser can't record audio. Please type your question below.");
+      pauseConversation("This browser can't record audio. Please type your question below.");
       return;
     }
     if ("speechSynthesis" in window) window.speechSynthesis.cancel();
 
     let stream: MediaStream;
     try {
-      stream = await navigator.mediaDevices.getUserMedia({ audio: { echoCancellation: true, noiseSuppression: true } });
+      stream = await navigator.mediaDevices.getUserMedia({
+        audio: { echoCancellation: true, noiseSuppression: true, autoGainControl: true },
+      });
     } catch (err) {
       const name = (err as DOMException).name;
-      setNotice(
+      pauseConversation(
         name === "NotAllowedError" || name === "SecurityError"
           ? "Microphone access was blocked. Allow it in your browser's site settings, or type your question below."
           : name === "NotFoundError"
             ? "No microphone was found. You can type your question below."
-            : "Couldn't start the microphone. You can type your question below.",
+            : "Couldn't start the microphone. Tap the mic to try again, or type your question below.",
       );
+      setStatus("idle");
       return;
     }
 
@@ -283,7 +449,7 @@ export default function VoiceBot() {
       rec = mime ? new MediaRecorder(stream, { mimeType: mime, audioBitsPerSecond: 64_000 }) : new MediaRecorder(stream);
     } catch {
       stream.getTracks().forEach((t) => t.stop());
-      setNotice("This browser can't record audio in a supported format. Please type your question below.");
+      pauseConversation("This browser can't record audio in a supported format. Please type your question below.");
       return;
     }
 
@@ -297,7 +463,7 @@ export default function VoiceBot() {
     };
     rec.onstop = () => {
       releaseMic();
-      clearTimers();
+      clearRecordTimers();
       setSeconds(0);
       if (cancelledRef.current) {
         setStatus("idle");
@@ -310,13 +476,22 @@ export default function VoiceBot() {
     rec.start(250);
     setStatus("listening");
     setSeconds(0);
+    setHearing(false);
+    startVad(stream);
     const startedAt = Date.now();
     timersRef.current.tick = window.setInterval(() => setSeconds(Math.floor((Date.now() - startedAt) / 1000)), 250);
     timersRef.current.stop = window.setTimeout(() => stopRecording(), MAX_RECORD_MS);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [sendAudio, stopRecording]);
 
+  useEffect(() => {
+    startRecordingRef.current = () => void startRecording();
+  }, [startRecording]);
+
   const stopAll = useCallback(() => {
+    setConversation(false);
     cancelledRef.current = true;
+    clearSpeakTimers();
     stopRecording();
     releaseMic();
     abortRef.current?.abort();
@@ -326,11 +501,28 @@ export default function VoiceBot() {
   }, [stopRecording]);
 
   const onMic = () => {
-    if (status === "listening") stopRecording();
-    else if (status === "idle" || status === "speaking") void startRecording();
+    ensureAudioContext();
+    setNotice(null);
+    if (status === "listening") {
+      stopRecording(); // send now without waiting for the pause
+    } else if (status === "idle" || status === "speaking") {
+      setConversation(handsFree);
+      emptyTurnsRef.current = 0;
+      void startRecording();
+    }
   };
 
   const busy = status === "thinking" || status === "listening";
+
+  const statusLabel = (() => {
+    if (status === "listening") {
+      if (handsFree) return hearing ? "Listening... just pause when you're done" : "Listening... go ahead";
+      return "Listening... tap again when you're done";
+    }
+    if (status === "thinking") return "Thinking...";
+    if (status === "speaking") return inConversation ? "Speaking... I'll listen again right after" : "Speaking...";
+    return handsFree ? "Tap the mic to start a conversation" : "Tap the mic and ask me anything";
+  })();
 
   const ringColor =
     status === "listening" ? "text-rose-500" : status === "speaking" ? "text-emerald-500" : status === "thinking" ? "text-amber-500" : "";
@@ -350,7 +542,7 @@ export default function VoiceBot() {
             type="button"
             onClick={onMic}
             disabled={status === "thinking"}
-            aria-label={status === "listening" ? "Stop recording and send" : "Start recording"}
+            aria-label={status === "listening" ? "Send now" : handsFree ? "Start conversation" : "Start recording"}
             aria-pressed={status === "listening"}
             className={`relative z-10 grid h-24 w-24 place-items-center rounded-full text-white shadow-lg transition focus:outline-none focus-visible:ring-4 focus-visible:ring-indigo-400/60 disabled:cursor-not-allowed disabled:opacity-60 ${
               status === "listening" ? "bg-rose-600 hover:bg-rose-500" : "bg-indigo-600 hover:bg-indigo-500"
@@ -371,20 +563,42 @@ export default function VoiceBot() {
           {status !== "idle" && <span className={`pulse-ring pointer-events-none absolute inset-0 rounded-full ${ringColor}`} aria-hidden="true" />}
         </div>
 
-        <p className="min-h-6 text-sm font-medium text-slate-700 dark:text-slate-300" role="status" aria-live="polite">
-          {STATUS_LABEL[status]}
+        {/* Mic level meter so people can see they are being heard */}
+        <div className="h-1.5 w-40 overflow-hidden rounded-full bg-slate-200 dark:bg-slate-800" aria-hidden="true">
+          <div
+            className={`h-full rounded-full transition-[width] duration-75 ${hearing ? "bg-emerald-500" : "bg-rose-400"}`}
+            style={{ width: `${status === "listening" ? Math.round(level * 100) : 0}%` }}
+          />
+        </div>
+
+        <p className="min-h-6 text-center text-sm font-medium text-slate-700 dark:text-slate-300" role="status" aria-live="polite">
+          {statusLabel}
           {status === "listening" && ` (${seconds}s / 30s)`}
         </p>
 
-        {status !== "idle" && (
-          <button
-            type="button"
-            onClick={stopAll}
-            className="rounded-full border border-slate-300 px-4 py-1.5 text-sm hover:bg-slate-100 dark:border-slate-700 dark:hover:bg-slate-800"
-          >
-            Stop
-          </button>
-        )}
+        <div className="flex flex-wrap items-center justify-center gap-3">
+          {(status !== "idle" || inConversation) && (
+            <button
+              type="button"
+              onClick={stopAll}
+              className="rounded-full border border-slate-300 px-4 py-1.5 text-sm hover:bg-slate-100 dark:border-slate-700 dark:hover:bg-slate-800"
+            >
+              {inConversation ? "End conversation" : "Stop"}
+            </button>
+          )}
+          <label className="flex cursor-pointer select-none items-center gap-2 text-xs text-slate-600 dark:text-slate-400">
+            <input
+              type="checkbox"
+              checked={handsFree}
+              onChange={(e) => {
+                setHandsFree(e.target.checked);
+                if (!e.target.checked) setConversation(false);
+              }}
+              className="h-4 w-4 accent-indigo-600"
+            />
+            Hands-free (auto-detect when I stop talking)
+          </label>
+        </div>
 
         {notice && (
           <p role="alert" className="w-full rounded-lg border border-amber-300 bg-amber-50 px-3 py-2 text-sm text-amber-900 dark:border-amber-700/60 dark:bg-amber-950/40 dark:text-amber-200">
