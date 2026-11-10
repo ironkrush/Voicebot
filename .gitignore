@@ -1,0 +1,16 @@
+node_modules/
+.next/
+out/
+coverage/
+*.tsbuildinfo
+next-env.d.ts
+.vercel/
+.DS_Store
+npm-debug.log*
+
+# Secrets: never commit real env files
+.env*
+!.env.example
+
+# Personal working notes
+voicebot-kit.md
